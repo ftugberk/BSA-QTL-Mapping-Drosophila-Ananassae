@@ -1,0 +1,195 @@
+#!/bin/bash
+
+# Universal pipeline for preprocessing raw sequencing data from pool populations.
+# Main aim of the pipeline is to obtain properly formated .table files which would 
+# have the required data metrics on variant for BSA-QTL analysis, specifically using 
+# QTLseqr published by Mansfeld & Grumet et al,. 2018
+
+# Configuration
+
+
+# Paths to reference genome (FASTA format, already indexed)
+REF_GENOME="/path/to/reference/genome.fa"  # Replace with your reference genome path
+
+# Number of threads to use on the system
+THREADS=14
+
+# Output directories
+SAM_DIR="/path/to/output/sam_files"
+BAM_DIR="/path/to/output/bam_files"
+VCF_DIR="/path/to/output/vcf_files"
+GATK_TABLE_DIR="/path/to/output/gatk_tables"
+
+# Create output directories if they don't exist
+mkdir -p "$SAM_DIR" "$BAM_DIR" "$VCF_DIR" "$GATK_TABLE_DIR"
+
+# Samples and Read Files
+# ======================
+
+# Define sample names
+SAMPLES=("sample1" "sample2" "sample3")  # Replace with your sample names
+
+# Define read files for each sample (paired-end)
+declare -A READ1_FILES
+declare -A READ2_FILES
+
+# Example for sample1
+READ1_FILES["sample1"]=( "/path/to/sample1_read1_lane1.fq.gz" "/path/to/sample1_read1_lane2.fq.gz" )
+READ2_FILES["sample1"]=( "/path/to/sample1_read2_lane1.fq.gz" "/path/to/sample1_read2_lane2.fq.gz" )
+
+# Example for sample2
+READ1_FILES["sample2"]=( "/path/to/sample2_read1.fq.gz" )
+READ2_FILES["sample2"]=( "/path/to/sample2_read2.fq.gz" )
+
+# Add more samples as needed
+
+# Chromosomes of interest, replace with your chromosome names
+CHROMOSOMES="chr1,chr2,chr3"  
+
+# Mapping Reads to Reference Genome with NextGenMap
+
+
+echo "Starting read mapping with NextGenMap"
+for SAMPLE in "${SAMPLES[@]}"; do
+    echo "Processing $SAMPLE"
+
+    # Combine multiple read files if necessary
+    READ1_COMBINED="$SAM_DIR/${SAMPLE}_R1_combined.fq.gz"
+    READ2_COMBINED="$SAM_DIR/${SAMPLE}_R2_combined.fq.gz"
+    cat "${READ1_FILES[$SAMPLE][@]}" > "$READ1_COMBINED"
+    cat "${READ2_FILES[$SAMPLE][@]}" > "$READ2_COMBINED"
+
+    # Run NextGenMap
+    ngm -r "$REF_GENOME" -1 "$READ1_COMBINED" -2 "$READ2_COMBINED" \
+        -o "$SAM_DIR/${SAMPLE}.sam" -t "$THREADS"
+
+    # Clean up combined read files
+    rm "$READ1_COMBINED" "$READ2_COMBINED"
+    echo "Finished mapping $SAMPLE."
+done
+
+# Converting SAM to BAM, Fixing Mate Information, Sorting, and Indexing
+
+echo "Starting SAM to BAM conversion and processing."
+for SAMPLE in "${SAMPLES[@]}"; do
+    echo "Processing $SAMPLE"
+
+    SAM_FILE="$SAM_DIR/${SAMPLE}.sam"
+    BAM_FILE="$BAM_DIR/${SAMPLE}.bam"
+    FIXMATE_BAM="$BAM_DIR/${SAMPLE}_fixmate.bam"
+    SORTED_BAM="$BAM_DIR/${SAMPLE}_sorted.bam"
+
+    # Convert SAM to BAM
+    samtools view -Sb "$SAM_FILE" > "$BAM_FILE"
+
+    # Fix mate information
+    samtools fixmate -m "$BAM_FILE" "$FIXMATE_BAM"
+
+    # Sort BAM file
+    samtools sort "$FIXMATE_BAM" -o "$SORTED_BAM"
+
+    # Index the sorted BAM file
+    samtools index "$SORTED_BAM"
+
+    # Remove intermediate files
+    rm "$SAM_FILE" "$BAM_FILE" "$FIXMATE_BAM"
+    echo "Finished processing $SAMPLE."
+done
+
+# Variant Calling with FreeBayes
+
+
+echo "Starting variant calling with FreeBayes..."
+for SAMPLE in "${SAMPLES[@]}"; do
+    echo "Processing $SAMPLE."
+
+    SORTED_BAM="$BAM_DIR/${SAMPLE}_sorted.bam"
+    VCF_FILE="$VCF_DIR/${SAMPLE}.vcf"
+
+    freebayes -f "$REF_GENOME" "$SORTED_BAM" > "$VCF_FILE"
+
+    # Compress and index the VCF file
+    bgzip "$VCF_FILE"
+    tabix -p vcf "${VCF_FILE}.gz"
+    echo "Finished variant calling for $SAMPLE."
+done
+
+# Filtering VCF Files with BCFtools
+
+
+echo "Starting VCF filtering..."
+FILTER_CRITERIA='QUAL>50 && INFO/DP>50 && FORMAT/DP>50' # Replace your filtering criteria
+
+for SAMPLE in "${SAMPLES[@]}"; do
+    echo "Processing $SAMPLE..."
+
+    VCF_FILE="${VCF_DIR}/${SAMPLE}.vcf.gz"
+    FILTERED_VCF="${VCF_DIR}/${SAMPLE}_filtered.vcf.gz"
+
+    bcftools view -i "$FILTER_CRITERIA" "$VCF_FILE" -Oz -o "$FILTERED_VCF"
+
+    # Index the filtered VCF file
+    bcftools index "$FILTERED_VCF"
+    echo "Finished filtering VCF for $SAMPLE."
+done
+
+# Extracting Variants Only on Chromosomes
+
+echo "Extracting variants on specified chromosomes..."
+for SAMPLE in "${SAMPLES[@]}"; do
+    echo "Processing $SAMPLE."
+
+    FILTERED_VCF="${VCF_DIR}/${SAMPLE}_filtered.vcf.gz"
+    CHR_ONLY_VCF="${VCF_DIR}/${SAMPLE}_chr_only.vcf.gz"
+
+    bcftools view -r "$CHROMOSOMES" "$FILTERED_VCF" -Oz -o "$CHR_ONLY_VCF"
+
+    # Index the chromosome-only VCF file
+    bcftools index "$CHR_ONLY_VCF"
+    echo "Finished extracting chromosomes for $SAMPLE."
+done
+
+# Preparing Data for GATK VariantsToTable
+
+echo "Preparing data for GATK VariantsToTable."
+
+# Remove indels (keep only SNPs)
+for SAMPLE in "${SAMPLES[@]}"; do
+    echo "Processing $SAMPLE."
+
+    CHR_ONLY_VCF="${VCF_DIR}/${SAMPLE}_chr_only.vcf.gz"
+    SNPS_VCF="${VCF_DIR}/${SAMPLE}_snps.vcf.gz"
+
+    bcftools view -v snps "$CHR_ONLY_VCF" -Oz -o "$SNPS_VCF"
+    bcftools index "$SNPS_VCF"
+
+    echo "Finished preparing only SNPs VCF for $SAMPLE."
+done
+
+# Using GATK VariantsToTable to Create Tables
+
+echo "Creating tables with GATK VariantsToTable."
+
+# Ensure GATK is in your PATH or provide the full path to GATK
+
+for SAMPLE in "${SAMPLES[@]}"; do
+    echo "Processing $SAMPLE..."
+
+    SNPS_VCF="${VCF_DIR}/${SAMPLE}_snps.vcf.gz"
+    TABLE_FILE="${GATK_TABLE_DIR}/${SAMPLE}.table"
+
+    # Index VCF with GATK if necessary
+    gatk IndexFeatureFile -I "$SNPS_VCF"
+
+    # Use GATK VariantsToTable
+    gatk VariantsToTable \
+        -R "$REF_GENOME" \
+        -V "$SNPS_VCF" \
+        -F CHROM -F POS -F REF -F ALT \
+        -GF AD -GF DP -GF GT \
+        -O "$TABLE_FILE"
+
+    echo "Finished creating table for $SAMPLE."
+done
+
+echo "Pipeline completed successfully."
